@@ -85,6 +85,10 @@ When nil, only the first frame of animated media will be displayed."
   "If non-nil, automatically display the chat buffer when a message arrives."
   :type 'boolean)
 
+(defcustom signel-import-osx-contacts-on-start (eq system-type 'darwin)
+  "If non-nil and on macOS, automatically import contacts from Contacts app on startup."
+  :type 'boolean)
+
 ;;; Faces
 
 (defface signel-my-msg-face
@@ -122,6 +126,9 @@ When nil, only the first frame of animated media will be displayed."
 
 (defvar signel--active-chats (make-hash-table :test 'equal)
   "Set of currently active chat IDs.")
+
+(defvar signel--rpc-callback-map (make-hash-table :test 'equal)
+  "Mapping of RPC ID to callback functions.")
 
 (defvar signel--partial-line ""
   "Buffer string for incomplete JSON lines received from the process.")
@@ -169,7 +176,9 @@ When nil, only the first frame of animated media will be displayed."
                :coding 'utf-8-unix)))
     (set-process-query-on-exit-flag proc nil)
     (signel--log "Signel service started.")
-    (message "Signel service started.")))
+    (message "Signel service started.")
+    (when (and signel-import-osx-contacts-on-start (eq system-type 'darwin))
+      (signel-import-osx-contacts))))
 
 (defun signel-stop ()
   "Stop the Signel service."
@@ -178,10 +187,11 @@ When nil, only the first frame of animated media will be displayed."
     (delete-process signel--process-name)
     (message "Signel service stopped.")))
 
-(defun signel--send-rpc (method params &optional target-buffer)
+(defun signel--send-rpc (method params &optional target-buffer callback)
   "Send a JSON-RPC payload with METHOD and PARAMS.
 If TARGET-BUFFER is non-nil, map the request ID to that buffer for
-error handling."
+error handling.
+If CALLBACK is a function, register it to run on response."
   (unless (get-process signel--process-name)
     (error "Signel service not running. M-x signel-start"))
   (let* ((id (cl-incf signel--rpc-id-counter))
@@ -190,6 +200,8 @@ error handling."
                 (params . ,params)
                 (id . ,id)))
          (json-str (json-encode req)))
+    (when callback
+      (puthash id callback signel--rpc-callback-map))
     (when target-buffer
       (puthash id (buffer-name target-buffer) signel--request-buffer-map))
     (signel--log "SEND: %s" json-str)
@@ -232,10 +244,20 @@ error handling."
   (let ((method (alist-get 'method json))
         (error-obj (alist-get 'error json))
         (id (alist-get 'id json))
+        (result (alist-get 'result json))
         (params (alist-get 'params json)))
     (cond
      ((string= method "receive") (signel--handle-receive params))
-     (error-obj (signel--handle-error id error-obj)))))
+     (error-obj
+      (let ((callback (and id (gethash id signel--rpc-callback-map))))
+        (when callback (remhash id signel--rpc-callback-map))
+        (signel--handle-error id error-obj)))
+     (id
+      ;; This is a response to an RPC request
+      (let ((callback (gethash id signel--rpc-callback-map)))
+        (when callback
+          (remhash id signel--rpc-callback-map)
+          (run-at-time 0 nil callback result)))))))
 
 (defun signel--handle-error (id error-obj)
   "Handle RPC errors for request ID using ERROR-OBJ."
@@ -577,6 +599,122 @@ Returns nil if ID is a phone number (+) or UUID (contains -)."
   (let ((buffer (signel--get-buffer recipient)))
     (switch-to-buffer buffer)
     (message "Chat opened.")))
+
+;;;###autoload
+(defun signel-chat-contact ()
+  "Select a contact from your list of Signal contacts and open a chat."
+  (interactive)
+  (message "Fetching contacts...")
+  (signel--send-rpc
+   "listContacts" nil nil
+   (lambda (result)
+     (let (candidates)
+       (dolist (contact (append result nil))
+         (let* ((num (alist-get 'number contact))
+                ;; 1. Local contact list name
+                (local-name (alist-get 'name contact))
+                ;; 2. Signal username (e.g. bunnylushington.40)
+                (username (alist-get 'username contact))
+                ;; 3. Profile details
+                (profile (alist-get 'profile contact))
+                (profile-given (and profile (alist-get 'givenName profile)))
+                (profile-family (and profile (alist-get 'familyName profile)))
+                ;; 4. Local nickname details
+                (nick-given (alist-get 'nickGivenName contact))
+                (nick-family (alist-get 'nickFamilyName contact))
+                ;; Resolve the display name based on priority
+                (resolved-name
+                 (cond
+                  ;; A. Use local contact name if not empty
+                  ((and local-name (not (string-empty-p local-name)))
+                   local-name)
+                  ;; B. Use nickname if present
+                  ((and (or nick-given nick-family)
+                        (not (string-empty-p (concat nick-given nick-family))))
+                   (string-trim (concat nick-given " " nick-family)))
+                  ;; C. Use profile name if present
+                  ((and (or profile-given profile-family)
+                        (not (string-empty-p (concat profile-given profile-family))))
+                   (string-trim (concat profile-given " " profile-family)))
+                  ;; D. Use username if present
+                  ((and username (not (string-empty-p username)))
+                   username)
+                  ;; E. Otherwise, nil
+                  (t nil)))
+                (cand (if resolved-name
+                          (format "%s (%s)" num resolved-name)
+                        num)))
+           (when num
+             (push (cons cand num) candidates)
+             ;; Keep our local contact map cache updated!
+             (when resolved-name
+               (puthash num resolved-name signel--contact-map)))))
+       (if (null candidates)
+           (message "No contacts found.")
+         (let* ((choice (completing-read "Select Signal Contact: " (mapcar #'car candidates) nil t))
+                (selected-num (cdr (assoc choice candidates))))
+           (when selected-num
+             (signel-chat selected-num))))))))
+;;; macOS Address Book Integration
+
+(defun signel--normalize-phone (phone)
+  "Normalize PHONE number to international E.164 format digits."
+  (when phone
+    (let* ((cleaned (replace-regexp-in-string "[^0-9+]" "" phone)))
+      (cond
+       ;; Starts with '+' - already internationalized
+       ((string-prefix-p "+" cleaned)
+        cleaned)
+       ;; 11 digits starting with '1' - prepend '+'
+       ((and (= (length cleaned) 11) (string-prefix-p "1" cleaned))
+        (concat "+" cleaned))
+       ;; 10 digits (US/Canada) - prepend '+1'
+       ((= (length cleaned) 10)
+        (concat "+1" cleaned))
+       ;; Otherwise, return as-is
+       (t cleaned)))))
+
+;;;###autoload
+(defun signel-import-osx-contacts ()
+  "Import names and phone numbers from macOS Contacts into `signel--contact-map`."
+  (interactive)
+  (unless (eq system-type 'darwin)
+    (user-error "macOS Address Book integration is only supported on macOS"))
+  (message "Importing contacts from macOS Contacts...")
+  (let* ((script "
+tell application \"Contacts\"
+    set out to \"\"
+    repeat with p in people
+        set full_name to name of p
+        repeat with ph in phones of p
+            set num to value of ph
+            set out to out & full_name & \"\\t\" & num & \"\\n\"
+        end repeat
+    end repeat
+    return out
+end tell
+")
+         (process (make-process
+                   :name "signel-osx-contacts"
+                   :buffer " *signel-osx-contacts*"
+                   :command (list "osascript" "-e" script)
+                   :sentinel
+                   (lambda (proc event)
+                     (when (string-prefix-p "exited" event)
+                       (with-current-buffer (process-buffer proc)
+                         (let ((lines (split-string (buffer-string) "\n" t))
+                               (count 0))
+                           (dolist (line lines)
+                             (let* ((parts (split-string line "\t"))
+                                    (name (car parts))
+                                    (raw-phone (cadr parts))
+                                    (phone (signel--normalize-phone raw-phone)))
+                               (when (and name phone (not (string-empty-p name)))
+                                 (puthash phone name signel--contact-map)
+                                 (setq count (1+ count)))))
+                           (message "Successfully imported %d contact numbers from macOS Address Book." count)))
+                       (signel--dashboard-refresh))))))
+    (set-process-query-on-exit-flag process nil)))
 
 ;;; Dashboard
 
