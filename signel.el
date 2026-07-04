@@ -490,15 +490,25 @@ Handles animation support if enabled."
 
 (defun signel--get-buffer (id)
   "Get or create a chat buffer for ID."
-  (let* ((buf-name (format "*Signel: %s*" id))
-         (buffer (get-buffer buf-name)))
-    (unless buffer
-      (setq buffer (get-buffer-create buf-name))
-      (with-current-buffer buffer
-        (signel-chat-mode)
-        (setq signel--chat-id id)
-        (signel--draw-prompt)))
-    buffer))
+  (let ((existing-buf (cl-find-if (lambda (buf)
+                                    (with-current-buffer buf
+                                      (and (eq major-mode 'signel-chat-mode)
+                                           (string= signel--chat-id id))))
+                                  (buffer-list))))
+    (if existing-buf
+        existing-buf
+      (let* ((name (gethash id signel--contact-map))
+             (formatted-id (signel--format-phone id))
+             (display-label (if name
+                                (format "%s (%s)" formatted-id name)
+                              formatted-id))
+             (buf-name (format "*Signel: %s*" display-label))
+             (buffer (get-buffer-create buf-name)))
+        (with-current-buffer buffer
+          (signel-chat-mode)
+          (setq signel--chat-id id)
+          (signel--draw-prompt))
+        buffer))))
 
 (defun signel--draw-prompt ()
   "Draw the input prompt and update the input marker."
@@ -712,6 +722,22 @@ All other numbers are returned as-is."
             (prin1 data (current-buffer)))))
     (error (message "Error saving Signel contacts cache: %s" err))))
 
+(defun signel--rename-active-buffers ()
+  "Rename any active chat buffers to match their resolved contact names."
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (and (eq major-mode 'signel-chat-mode)
+                 signel--chat-id)
+        (let* ((id signel--chat-id)
+               (name (gethash id signel--contact-map))
+               (formatted-id (signel--format-phone id))
+               (display-label (if name
+                                  (format "%s (%s)" formatted-id name)
+                                formatted-id))
+               (new-name (format "*Signel: %s*" display-label)))
+          (unless (string= (buffer-name) new-name)
+            (rename-buffer new-name t)))))))
+
 (defun signel--load-contacts-cache ()
   "Load contact mapping from `signel-contacts-cache-file` into `signel--contact-map`."
   (when (file-exists-p signel-contacts-cache-file)
@@ -725,7 +751,8 @@ All other numbers are returned as-is."
                       (name (cdr item)))
                   (when (and phone name)
                     (puthash phone name signel--contact-map)))))))
-      (error (message "Error loading Signel contacts cache: %s" err)))))
+      (error (message "Error loading Signel contacts cache: %s" err))))
+  (signel--rename-active-buffers))
 
 ;;;###autoload
 (defun signel-import-osx-contacts ()
@@ -767,7 +794,8 @@ end tell
                                  (setq count (1+ count)))))
                            (signel--save-contacts-cache)
                            (message "Successfully imported %d contact numbers from macOS Address Book and updated cache." count)))
-                       (signel--dashboard-refresh))))))
+                       (signel--dashboard-refresh)
+                       (signel--rename-active-buffers))))))
     (set-process-query-on-exit-flag process nil)))
 
 ;;; Dashboard
