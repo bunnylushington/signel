@@ -497,7 +497,9 @@ Handles animation support if enabled."
                                   (buffer-list))))
     (if existing-buf
         existing-buf
-      (let* ((name (gethash id signel--contact-map))
+      (let* ((name (or (gethash id signel--contact-map)
+                       (and (not (signel--is-group-id id))
+                            (gethash (signel--normalize-phone id) signel--contact-map))))
              (formatted-id (signel--format-phone id))
              (display-label (if name
                                 (format "%s (%s)" formatted-id name)
@@ -656,7 +658,10 @@ Returns nil if ID is a phone number (+) or UUID (contains -)."
                   ;; D. Use username if present
                   ((and username (not (string-empty-p username)))
                    username)
-                  ;; E. Otherwise, nil
+                  ;; E. Use macOS Address Book cache if available
+                  ((and num (gethash (signel--normalize-phone num) signel--contact-map))
+                   (gethash (signel--normalize-phone num) signel--contact-map))
+                  ;; F. Otherwise, nil
                   (t nil)))
                 (cand (let ((formatted-num (signel--format-phone num)))
                         (if resolved-name
@@ -729,7 +734,9 @@ All other numbers are returned as-is."
       (when (and (eq major-mode 'signel-chat-mode)
                  signel--chat-id)
         (let* ((id signel--chat-id)
-               (name (gethash id signel--contact-map))
+               (name (or (gethash id signel--contact-map)
+                         (and (not (signel--is-group-id id))
+                              (gethash (signel--normalize-phone id) signel--contact-map))))
                (formatted-id (signel--format-phone id))
                (display-label (if name
                                   (format "%s (%s)" formatted-id name)
@@ -823,7 +830,10 @@ end tell
     (insert "Active Chats:\n")
     (insert "-------------\n")
     (maphash (lambda (id _)
-               (let* ((name (gethash id signel--contact-map id))
+               (let* ((name (or (gethash id signel--contact-map)
+                                (and (not (signel--is-group-id id))
+                                     (gethash (signel--normalize-phone id) signel--contact-map))
+                                id))
                       (disp-name (if (string= name id)
                                      (signel--format-phone id)
                                    (format "%s (%s)" name (signel--format-phone id)))))
