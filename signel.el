@@ -780,7 +780,8 @@ end tell
                    :command (list "osascript" "-e" script)
                    :sentinel
                    (lambda (proc event)
-                     (when (string-prefix-p "exited" event)
+                     (cond
+                      ((string-prefix-p "finished" event)
                        (with-current-buffer (process-buffer proc)
                          (let ((lines (split-string (buffer-string) "\n" t))
                                (count 0))
@@ -795,7 +796,9 @@ end tell
                            (signel--save-contacts-cache)
                            (message "Successfully imported %d contact numbers from macOS Address Book and updated cache." count)))
                        (signel--dashboard-refresh)
-                       (signel--rename-active-buffers))))))
+                       (signel--rename-active-buffers))
+                      ((string-prefix-p "exited" event)
+                       (message "macOS Address Book import process failed: %s" (string-trim event))))))))
     (set-process-query-on-exit-flag process nil)))
 
 ;;; Dashboard
