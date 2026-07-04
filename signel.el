@@ -89,6 +89,10 @@ When nil, only the first frame of animated media will be displayed."
   "If non-nil and on macOS, automatically import contacts from Contacts app on startup."
   :type 'boolean)
 
+(defcustom signel-contacts-cache-file (expand-file-name ".signel-contacts-cache" user-emacs-directory)
+  "File path to store the persisted macOS Contacts cache."
+  :type 'file)
+
 ;;; Faces
 
 (defface signel-my-msg-face
@@ -177,7 +181,10 @@ When nil, only the first frame of animated media will be displayed."
     (set-process-query-on-exit-flag proc nil)
     (signel--log "Signel service started.")
     (message "Signel service started.")
-    (when (and signel-import-osx-contacts-on-start (eq system-type 'darwin))
+    (signel--load-contacts-cache)
+    (when (and (eq system-type 'darwin)
+               signel-import-osx-contacts-on-start
+               (not (file-exists-p signel-contacts-cache-file)))
       (signel-import-osx-contacts))))
 
 (defun signel-stop ()
@@ -691,6 +698,35 @@ All other numbers are returned as-is."
               (match-string 3 phone))
     phone))
 
+(defun signel--save-contacts-cache ()
+  "Save the current `signel--contact-map` cache into `signel-contacts-cache-file`."
+  (condition-case err
+      (let (data)
+        (maphash (lambda (phone name)
+                   (push (cons phone name) data))
+                 signel--contact-map)
+        (with-temp-file signel-contacts-cache-file
+          (let ((print-level nil)
+                (print-length nil))
+            (insert ";; Signel Contacts Cache - Auto-generated, do not edit\n")
+            (prin1 data (current-buffer)))))
+    (error (message "Error saving Signel contacts cache: %s" err))))
+
+(defun signel--load-contacts-cache ()
+  "Load contact mapping from `signel-contacts-cache-file` into `signel--contact-map`."
+  (when (file-exists-p signel-contacts-cache-file)
+    (condition-case err
+        (with-temp-buffer
+          (insert-file-contents signel-contacts-cache-file)
+          (let ((data (car (read-from-string (buffer-string)))))
+            (when (listp data)
+              (dolist (item data)
+                (let ((phone (car item))
+                      (name (cdr item)))
+                  (when (and phone name)
+                    (puthash phone name signel--contact-map)))))))
+      (error (message "Error loading Signel contacts cache: %s" err)))))
+
 ;;;###autoload
 (defun signel-import-osx-contacts ()
   "Import names and phone numbers from macOS Contacts into `signel--contact-map`."
@@ -729,7 +765,8 @@ end tell
                                (when (and name phone (not (string-empty-p name)))
                                  (puthash phone name signel--contact-map)
                                  (setq count (1+ count)))))
-                           (message "Successfully imported %d contact numbers from macOS Address Book." count)))
+                           (signel--save-contacts-cache)
+                           (message "Successfully imported %d contact numbers from macOS Address Book and updated cache." count)))
                        (signel--dashboard-refresh))))))
     (set-process-query-on-exit-flag process nil)))
 
