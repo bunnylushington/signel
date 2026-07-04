@@ -641,9 +641,10 @@ Returns nil if ID is a phone number (+) or UUID (contains -)."
                    username)
                   ;; E. Otherwise, nil
                   (t nil)))
-                (cand (if resolved-name
-                          (format "%s (%s)" num resolved-name)
-                        num)))
+                (cand (let ((formatted-num (signel--format-phone num)))
+                        (if resolved-name
+                            (format "%s (%s)" formatted-num resolved-name)
+                          formatted-num))))
            (when num
              (push (cons cand num) candidates)
              ;; Keep our local contact map cache updated!
@@ -673,6 +674,22 @@ Returns nil if ID is a phone number (+) or UUID (contains -)."
         (concat "+1" cleaned))
        ;; Otherwise, return as-is
        (t cleaned)))))
+
+(defun signel--format-phone (phone)
+  "Format a PHONE number for user-facing display.
+US-based numbers (+1...) are formatted as (xxx) yyy-zzzz.
+All other numbers are returned as-is."
+  (if (and phone (string-match (rx string-start "+1"
+                                   (group (= 3 digit))
+                                   (group (= 3 digit))
+                                   (group (= 4 digit))
+                                   string-end)
+                               phone))
+      (format "(%s) %s-%s"
+              (match-string 1 phone)
+              (match-string 2 phone)
+              (match-string 3 phone))
+    phone))
 
 ;;;###autoload
 (defun signel-import-osx-contacts ()
@@ -738,8 +755,11 @@ end tell
     (insert "Active Chats:\n")
     (insert "-------------\n")
     (maphash (lambda (id _)
-               (let ((name (gethash id signel--contact-map id)))
-                 (insert-button (format "%s (%s)" name id)
+               (let* ((name (gethash id signel--contact-map id))
+                      (disp-name (if (string= name id)
+                                     (signel--format-phone id)
+                                   (format "%s (%s)" name (signel--format-phone id)))))
+                 (insert-button disp-name
                                 'action #'signel--dashboard-open-entry
                                 'signel-id id
                                 'follow-link t)
